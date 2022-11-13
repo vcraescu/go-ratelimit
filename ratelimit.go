@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
@@ -21,15 +22,17 @@ func (fn optionFunc) apply(cfg *config) {
 	fn(cfg)
 }
 
+var ErrNoWorkers = errors.New("no workers")
+
 type Limiter struct {
-	bucket chan struct{}
-	rate   int
-	once   sync.Once
-	ticker *time.Ticker
-	wg     sync.WaitGroup
-	init   chan struct{}
-	done   chan struct{}
-	per    time.Duration
+	bucket  chan struct{}
+	rate    int
+	once    sync.Once
+	ticker  *time.Ticker
+	wg      sync.WaitGroup
+	started chan struct{}
+	done    chan struct{}
+	per     time.Duration
 }
 
 func WithPer(per time.Duration) Option {
@@ -48,11 +51,11 @@ func NewLimiter(rate int, opts ...Option) *Limiter {
 	}
 
 	return &Limiter{
-		per:  cfg.per,
-		rate: rate,
-		wg:   sync.WaitGroup{},
-		init: make(chan struct{}, 1),
-		done: make(chan struct{}, 1),
+		per:     cfg.per,
+		rate:    rate,
+		wg:      sync.WaitGroup{},
+		started: make(chan struct{}, 1),
+		done:    make(chan struct{}, 1),
 	}
 }
 
@@ -89,25 +92,50 @@ func (l *Limiter) startBucketRefill() {
 	}()
 }
 
+func (l *Limiter) take() {
+	<-l.bucket
+}
+
+func (l *Limiter) runWorker(worker func()) {
+	defer l.wg.Done()
+
+	l.take()
+	worker()
+}
+
 func (l *Limiter) Run(worker func()) {
 	l.once.Do(l.startBucketRefill)
 	l.wg.Add(1)
 
-	l.tryChPush(l.init)
+	l.tryChPush(l.started)
 
-	go func() {
-		defer l.wg.Done()
-
-		<-l.bucket
-		worker()
-	}()
+	go l.runWorker(worker)
 }
 
-func (l *Limiter) Wait() {
-	<-l.init
-	l.wg.Wait()
+func (l *Limiter) isStarted() bool {
+	select {
+	case <-l.started:
+		return true
+	default:
+		return false
+	}
+}
 
+func (l *Limiter) reset() {
 	l.once = sync.Once{}
+	l.started = make(chan struct{}, 1)
 	l.ticker.Stop()
+}
+
+func (l *Limiter) Wait() error {
+	if !l.isStarted() {
+		return ErrNoWorkers
+	}
+
+	l.wg.Wait()
+	l.reset()
+
 	l.done <- struct{}{}
+
+	return nil
 }
